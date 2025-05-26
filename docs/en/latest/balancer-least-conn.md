@@ -10,9 +10,11 @@ The `least_conn` load balancer in Apache APISIX implements a dynamic load balanc
 
 The least connection algorithm maintains a count of active connections for each upstream server and selects the server with the lowest connection count for new requests. This approach helps ensure more even distribution of load, especially when connection durations vary.
 
+The algorithm uses a binary min-heap data structure to efficiently track and select servers with the lowest scores. Connection counts are persisted in nginx shared memory to maintain state across configuration reloads and worker process restarts.
+
 ### Score Calculation
 
-Each upstream server is assigned a score based on:
+Each upstream server is assigned a dynamic score that combines its base weight with current connection load:
 
 ```lua
 score = base_score + (connection_count * weight_factor)
@@ -20,10 +22,29 @@ score = base_score + (connection_count * weight_factor)
 
 Where:
 - `base_score = 1 / weight` - Base score inversely proportional to server weight
-- `connection_count` - Current number of active connections to the server
+- `connection_count` - Current number of active connections to the server  
 - `weight_factor = 1 / weight` - Weight adjustment factor
 
-Servers with lower scores are preferred for new connections.
+Servers with lower scores are preferred for new connections. The score is updated in real-time as connections are established and completed.
+
+### Connection State Management
+
+#### Real-time Updates
+- **Connection Start**: Score increases by `1/weight`, connection count incremented
+- **Connection End**: Score decreases by `1/weight`, connection count decremented
+- **Heap Maintenance**: Binary heap automatically reorders servers by score
+
+#### Persistence Strategy
+Connection counts are stored in nginx shared dictionary with structured keys:
+```
+conn_count:{upstream_id}:{server_address}
+```
+
+This ensures connection state survives:
+- Upstream configuration changes
+- Balancer instance recreation
+- Worker process restarts
+- Node additions/removals
 
 ### Connection Tracking
 
@@ -93,24 +114,19 @@ During balancer recreation:
 
 ## Configuration
 
-### Nginx Configuration
+### Automatic Setup
 
-Add the shared dictionary to your nginx configuration:
+The `balancer-least-conn` shared dictionary is automatically configured by APISIX with a default size of 10MB. No manual configuration is required.
 
-```nginx
-http {
-    lua_shared_dict balancer-least-conn 10m;
-    # ... other configurations
-}
-```
+### Custom Configuration (Optional)
 
-### APISIX Configuration
+If you need to adjust the shared dictionary size, you can override it in your configuration:
 
 ```yaml
 nginx_config:
   http:
     lua_shared_dict:
-      balancer-least-conn: 10m
+      balancer-least-conn: 20m  # Increase size if needed
 ```
 
 ### Upstream Configuration
@@ -186,9 +202,9 @@ local capacity = dict:capacity()
 ## Error Handling
 
 ### Missing Shared Dictionary
-If the shared dictionary is not configured, the balancer will fail to initialize with:
+If the shared dictionary is not available (which should not happen with default configuration), the balancer will fail to initialize with:
 ```
-shared dict 'balancer-least-conn' not found, please add 'lua_shared_dict balancer-least-conn 10m;' to your nginx configuration
+shared dict 'balancer-least-conn' not found
 ```
 
 ### Memory Exhaustion
@@ -205,7 +221,7 @@ When shared dictionary runs out of memory:
 ## Best Practices
 
 ### Configuration
-1. **Dictionary Size**: Allocate sufficient memory (10MB recommended for most cases)
+1. **Dictionary Size**: Default 10MB is sufficient for most cases (supports ~100k connections)
 2. **Server Weights**: Use appropriate weights to reflect server capacity
 3. **Health Checks**: Combine with health checks for robust load balancing
 
@@ -227,6 +243,6 @@ When shared dictionary runs out of memory:
 - Maintains existing behavior patterns
 
 ### Upgrade Considerations
-1. **Configuration**: Add shared dictionary configuration before upgrade
-2. **Memory**: Ensure sufficient memory allocation
+1. **Configuration**: Shared dictionary is automatically configured
+2. **Memory**: Default allocation should be sufficient for most use cases
 3. **Testing**: Validate load distribution in staging environment
