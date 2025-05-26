@@ -28,7 +28,14 @@ local _M = {}
 
 -- Shared dictionary to store connection counts across balancer recreations
 local CONN_COUNT_DICT_NAME = "balancer-least-conn"
-local conn_count_dict
+local conn_count_dict = ngx_shared[CONN_COUNT_DICT_NAME]
+
+-- Initialize shared dictionary at module load time
+if not conn_count_dict then
+    error("shared dict '" .. CONN_COUNT_DICT_NAME .. "' not found, " ..
+          "please add 'lua_shared_dict " .. CONN_COUNT_DICT_NAME .. " 10m;' " ..
+          "to your nginx configuration")
+end
 
 
 local function least_score(a, b)
@@ -36,25 +43,12 @@ local function least_score(a, b)
 end
 
 
--- Initialize the shared dictionary for connection tracking
-local function init_conn_count_dict()
-    if not conn_count_dict then
-        conn_count_dict = ngx_shared[CONN_COUNT_DICT_NAME]
-        if not conn_count_dict then
-            core.log.warn("shared dict ", CONN_COUNT_DICT_NAME, " not found, ",
-                         "connection state will not persist across upstream changes")
-        end
-    end
-    return conn_count_dict
-end
-
-
 -- Get the connection count key for a specific upstream and server
 local function get_conn_count_key(upstream, server)
     local upstream_id = upstream.parent and upstream.parent.value and upstream.parent.value.id
     if not upstream_id then
-        -- Fallback to a hash of the upstream configuration
-        upstream_id = ngx.crc32_short(core.json.encode(upstream))
+        -- Fallback to a hash of the upstream configuration using stable encoding
+        upstream_id = ngx.crc32_short(core.json.stably_encode(upstream))
     end
     return "conn_count:" .. tostring(upstream_id) .. ":" .. server
 end
@@ -62,26 +56,16 @@ end
 
 -- Get the current connection count for a server from shared dict
 local function get_server_conn_count(upstream, server)
-    local dict = init_conn_count_dict()
-    if not dict then
-        return 0
-    end
-    
     local key = get_conn_count_key(upstream, server)
-    local count = dict:get(key)
+    local count = conn_count_dict:get(key)
     return count or 0
 end
 
 
 -- Set the connection count for a server in shared dict
 local function set_server_conn_count(upstream, server, count)
-    local dict = init_conn_count_dict()
-    if not dict then
-        return
-    end
-    
     local key = get_conn_count_key(upstream, server)
-    local ok, err = dict:set(key, count)
+    local ok, err = conn_count_dict:set(key, count)
     if not ok then
         core.log.warn("failed to set connection count for ", server, ": ", err)
     end
@@ -90,13 +74,8 @@ end
 
 -- Increment the connection count for a server
 local function incr_server_conn_count(upstream, server, delta)
-    local dict = init_conn_count_dict()
-    if not dict then
-        return 0
-    end
-    
     local key = get_conn_count_key(upstream, server)
-    local new_count, err = dict:incr(key, delta or 1, 0)
+    local new_count, err = conn_count_dict:incr(key, delta or 1, 0)
     if not new_count then
         core.log.warn("failed to increment connection count for ", server, ": ", err)
         return 0
@@ -107,25 +86,20 @@ end
 
 -- Clean up connection counts for servers that are no longer in the upstream
 local function cleanup_stale_conn_counts(upstream, current_servers)
-    local dict = init_conn_count_dict()
-    if not dict then
-        return
-    end
-    
     local upstream_id = upstream.parent and upstream.parent.value and upstream.parent.value.id
     if not upstream_id then
-        upstream_id = ngx.crc32_short(core.json.encode(upstream))
+        upstream_id = ngx.crc32_short(core.json.stably_encode(upstream))
     end
     
     local prefix = "conn_count:" .. tostring(upstream_id) .. ":"
-    local keys = dict:get_keys(0)  -- Get all keys
+    local keys = conn_count_dict:get_keys(0)  -- Get all keys
     
     for _, key in ipairs(keys or {}) do
         if key:sub(1, #prefix) == prefix then
             local server = key:sub(#prefix + 1)
             if not current_servers[server] then
                 -- This server is no longer in the upstream, clean it up
-                dict:delete(key)
+                conn_count_dict:delete(key)
                 core.log.info("cleaned up stale connection count for server: ", server)
             end
         end
