@@ -32,9 +32,10 @@ local conn_count_dict = ngx_shared[CONN_COUNT_DICT_NAME]
 
 -- Initialize shared dictionary at module load time
 if not conn_count_dict then
-    error("shared dict '" .. CONN_COUNT_DICT_NAME .. "' not found, " ..
-          "please add 'lua_shared_dict " .. CONN_COUNT_DICT_NAME .. " 10m;' " ..
-          "to your nginx configuration")
+    core.log.error("shared dict '", CONN_COUNT_DICT_NAME, "' not found, ",
+                   "please add 'lua_shared_dict ", CONN_COUNT_DICT_NAME, " 10m;' ",
+                   "to your nginx configuration")
+    error("shared dict '" .. CONN_COUNT_DICT_NAME .. "' not found")
 end
 
 
@@ -57,7 +58,11 @@ end
 -- Get the current connection count for a server from shared dict
 local function get_server_conn_count(upstream, server)
     local key = get_conn_count_key(upstream, server)
-    local count = conn_count_dict:get(key)
+    local count, err = conn_count_dict:get(key)
+    if err then
+        core.log.error("failed to get connection count for ", server, ": ", err)
+        return 0
+    end
     return count or 0
 end
 
@@ -67,7 +72,7 @@ local function set_server_conn_count(upstream, server, count)
     local key = get_conn_count_key(upstream, server)
     local ok, err = conn_count_dict:set(key, count)
     if not ok then
-        core.log.warn("failed to set connection count for ", server, ": ", err)
+        core.log.error("failed to set connection count for ", server, ": ", err)
     end
 end
 
@@ -77,7 +82,7 @@ local function incr_server_conn_count(upstream, server, delta)
     local key = get_conn_count_key(upstream, server)
     local new_count, err = conn_count_dict:incr(key, delta or 1, 0)
     if not new_count then
-        core.log.warn("failed to increment connection count for ", server, ": ", err)
+        core.log.error("failed to increment connection count for ", server, ": ", err)
         return 0
     end
     return new_count
@@ -92,15 +97,23 @@ local function cleanup_stale_conn_counts(upstream, current_servers)
     end
     
     local prefix = "conn_count:" .. tostring(upstream_id) .. ":"
-    local keys = conn_count_dict:get_keys(0)  -- Get all keys
+    local keys, err = conn_count_dict:get_keys(0)  -- Get all keys
+    if err then
+        core.log.error("failed to get keys from shared dict: ", err)
+        return
+    end
     
     for _, key in ipairs(keys or {}) do
-        if key:sub(1, #prefix) == prefix then
+        if core.string.has_prefix(key, prefix) then
             local server = key:sub(#prefix + 1)
             if not current_servers[server] then
                 -- This server is no longer in the upstream, clean it up
-                conn_count_dict:delete(key)
-                core.log.info("cleaned up stale connection count for server: ", server)
+                local ok, delete_err = conn_count_dict:delete(key)
+                if not ok and delete_err then
+                    core.log.error("failed to delete stale connection count for server ", server, ": ", delete_err)
+                else
+                    core.log.info("cleaned up stale connection count for server: ", server)
+                end
             end
         end
     end
