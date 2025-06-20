@@ -73,9 +73,7 @@ lua {
     {% if status then %}
     lua_shared_dict status-report {* meta.lua_shared_dict["status-report"] *};
     {% end %}
-    {% if enable_stream then %}
     lua_shared_dict balancer-least-conn {* meta.lua_shared_dict["balancer-least-conn"] *};
-    {% end %}
 }
 
 {% if enabled_stream_plugins["prometheus"] and not enable_http then %}
@@ -287,9 +285,7 @@ http {
     lua_shared_dict balancer-ewma {* http.lua_shared_dict["balancer-ewma"] *};
     lua_shared_dict balancer-ewma-locks {* http.lua_shared_dict["balancer-ewma-locks"] *};
     lua_shared_dict balancer-ewma-last-touched-at {* http.lua_shared_dict["balancer-ewma-last-touched-at"] *};
-    {% if not enable_stream then %}
     lua_shared_dict balancer-least-conn {* http.lua_shared_dict["balancer-least-conn"] *};
-    {% end %}
     lua_shared_dict etcd-cluster-health-check {* http.lua_shared_dict["etcd-cluster-health-check"] *}; # etcd health check
 
     # for discovery shared dict
