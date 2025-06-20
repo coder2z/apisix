@@ -50,6 +50,10 @@ end
 
 -- Get the current connection count for a server from shared dict
 local function get_server_conn_count(upstream, server)
+    if not conn_count_dict then
+        return 0  -- Fallback when shared dict is not available
+    end
+    
     local key = get_conn_count_key(upstream, server)
     local count, err = conn_count_dict:get(key)
     if err then
@@ -63,6 +67,10 @@ end
 
 -- Increment the connection count for a server
 local function incr_server_conn_count(upstream, server, delta)
+    if not conn_count_dict then
+        return 0  -- Fallback when shared dict is not available
+    end
+    
     local key = get_conn_count_key(upstream, server)
     local new_count, err = conn_count_dict:incr(key, delta or 1, 0)
     if not new_count then
@@ -77,6 +85,10 @@ end
 
 -- Clean up connection counts for servers that are no longer in the upstream
 local function cleanup_stale_conn_counts(upstream, current_servers)
+    if not conn_count_dict then
+        return  -- Skip cleanup when shared dict is not available
+    end
+    
     local upstream_id = upstream.id
     if not upstream_id then
         upstream_id = ngx.crc32_short(dkjson.encode(upstream))
@@ -113,31 +125,34 @@ function _M.new(up_nodes, upstream)
     end
 
     if not conn_count_dict then
-        core.log.error("shared dict '", CONN_COUNT_DICT_NAME, "' not found")
-        return nil, "shared dict not found"
+        core.log.warn("shared dict '", CONN_COUNT_DICT_NAME, "' not found, ",
+                     "falling back to basic least_conn without persistent connection tracking")
     end
 
     local servers_heap = binaryHeap.minUnique(least_score)
 
-    -- Clean up stale connection counts for removed servers
+    -- Clean up stale connection counts for removed servers (only if shared dict is available)
     cleanup_stale_conn_counts(upstream, up_nodes)
 
     for server, weight in pairs(up_nodes) do
-        -- Get the persisted connection count for this server
+        -- Get the persisted connection count for this server (returns 0 if shared dict unavailable)
         local conn_count = get_server_conn_count(upstream, server)
-        -- Score directly reflects weighted connection count
+        -- Score calculation: when shared dict is unavailable, conn_count will be 0,
+        -- so this falls back to the original behavior: score = 1 / weight
         local score = (conn_count + 1) / weight
 
         core.log.debug("initializing server ", server,
                 " | weight: ", weight,
                 " | conn_count: ", conn_count,
                 " | score: ", score,
-                " | upstream_id: ", upstream.id or "no-id")
+                " | upstream_id: ", upstream.id or "no-id",
+                " | shared_dict_available: ", conn_count_dict and "yes" or "no")
 
         -- Note: the argument order of insert is different from others
         servers_heap:insert({
             server = server,
             weight = weight,
+            effect_weight = 1 / weight,  -- Keep for backward compatibility
             score = score,
         }, server)
     end
@@ -176,11 +191,17 @@ function _M.new(up_nodes, upstream)
                 return nil, err
             end
 
-            -- Get current connection count for detailed logging
-            local current_conn_count = get_server_conn_count(upstream, server)
-            info.score = (current_conn_count + 1) / info.weight
-            servers_heap:update(server, info)
-            incr_server_conn_count(upstream, server, 1)
+            if conn_count_dict then
+                -- Use persistent connection tracking when shared dict is available
+                local current_conn_count = get_server_conn_count(upstream, server)
+                info.score = (current_conn_count + 1) / info.weight
+                servers_heap:update(server, info)
+                incr_server_conn_count(upstream, server, 1)
+            else
+                -- Fallback to original logic when shared dict is not available
+                info.score = info.score + info.effect_weight
+                servers_heap:update(server, info)
+            end
             return server
         end,
         after_balance = function(ctx, before_retry)
@@ -191,14 +212,21 @@ function _M.new(up_nodes, upstream)
                 return
             end
 
-            local current_conn_count = get_server_conn_count(upstream, server)
-            info.score = (current_conn_count - 1) / info.weight
-            if info.score < 0 then
-                info.score = 0  -- Prevent negative scores
+            if conn_count_dict then
+                -- Use persistent connection tracking when shared dict is available
+                local current_conn_count = get_server_conn_count(upstream, server)
+                info.score = (current_conn_count - 1) / info.weight
+                if info.score < 0 then
+                    info.score = 0  -- Prevent negative scores
+                end
+                servers_heap:update(server, info)
+                -- Decrement connection count in shared dict
+                incr_server_conn_count(upstream, server, -1)
+            else
+                -- Fallback to original logic when shared dict is not available
+                info.score = info.score - info.effect_weight
+                servers_heap:update(server, info)
             end
-            servers_heap:update(server, info)
-            -- Decrement connection count in shared dict
-            incr_server_conn_count(upstream, server, -1)
 
             if not before_retry then
                 if ctx.balancer_tried_servers then
