@@ -160,6 +160,8 @@ stream {
     {% if enabled_stream_plugins["limit-conn"] then %}
     lua_shared_dict plugin-limit-conn-stream {* stream.lua_shared_dict["plugin-limit-conn-stream"] *};
     {% end %}
+    
+    lua_shared_dict balancer-least-conn {* stream.lua_shared_dict["balancer-least-conn"] *};
 
     # for discovery shared dict
     {% if discovery_shared_dicts then %}
